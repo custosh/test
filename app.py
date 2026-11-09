@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from bisect import bisect_left, bisect_right
 
 import numpy as np
@@ -166,6 +167,154 @@ def make_pairs_near_curve(
 
 
 # ----------------------------------------------------------------------
+# Factorization
+# ----------------------------------------------------------------------
+
+_TRIAL_PRIMES = [
+    p for p in range(2, 1000)
+    if all(p % d for d in range(2, math.isqrt(p) + 1))
+]
+
+
+def pollard_brent(n: int, deadline: float, rng: random.Random):
+    """Pollard-Brent rho. Returns a non-trivial divisor, or None on timeout."""
+    if n % 2 == 0:
+        return 2
+
+    batch = 128
+
+    while True:
+        if time.monotonic() > deadline:
+            return None
+
+        y = rng.randrange(1, n)
+        c = rng.randrange(1, n)
+        g = r = q = 1
+        x = ys = y
+
+        while g == 1:
+            x = y
+
+            for i in range(r):
+                y = (y * y + c) % n
+                if (i & 1023) == 1023 and time.monotonic() > deadline:
+                    return None
+
+            k = 0
+            while k < r and g == 1:
+                ys = y
+
+                for _ in range(min(batch, r - k)):
+                    y = (y * y + c) % n
+                    q = q * abs(x - y) % n
+
+                g = math.gcd(q, n)
+                k += batch
+
+                if g == 1 and time.monotonic() > deadline:
+                    return None
+
+            r *= 2
+
+        if g == n:
+            g = 1
+            while g == 1:
+                ys = (ys * ys + c) % n
+                g = math.gcd(abs(x - ys), n)
+
+        if g != n:
+            return g
+
+
+@st.cache_data(show_spinner=False)
+def factorize(n_text: str, time_limit: float):
+    """
+    Factorize N: trial division, Miller-Rabin and Pollard-Brent rho.
+
+    Returns (prime_factors, unresolved, elapsed) where prime_factors is a
+    sorted list of (prime, exponent) and unresolved lists composite
+    cofactors that were not split before the time limit.
+    """
+    n = int(n_text)
+    start = time.monotonic()
+    deadline = start + time_limit
+    rng = random.Random(0xFAC70)
+
+    found: dict[int, int] = {}
+    unresolved: list[int] = []
+
+    for p in _TRIAL_PRIMES:
+        while n % p == 0:
+            found[p] = found.get(p, 0) + 1
+            n //= p
+
+    stack = [n] if n > 1 else []
+
+    while stack:
+        m = stack.pop()
+
+        if m == 1:
+            continue
+
+        if is_probable_prime(m, 24, rng):
+            found[m] = found.get(m, 0) + 1
+            continue
+
+        d = pollard_brent(m, deadline, rng)
+
+        if d is None:
+            unresolved.append(m)
+            continue
+
+        stack.extend((d, m // d))
+
+    return sorted(found.items()), unresolved, time.monotonic() - start
+
+
+def format_factorization(factors, unresolved) -> str:
+    parts = [f"{p}^{e}" if e > 1 else str(p) for p, e in factors]
+    parts += [f"[composite {m}]" for m in unresolved]
+    return " × ".join(parts) if parts else "1"
+
+
+def divisor_pairs_in_square(
+    factors,
+    unresolved,
+    n: int,
+    bit_count: int,
+    max_divisors: int = 200_000,
+    max_pairs: int = 50,
+):
+    """
+    Pairs (d, N/d), d <= N/d, where both entries have exactly bit_count bits,
+    i.e. the factorizations that land inside the plotted prime square.
+    """
+    items = list(factors) + [(m, 1) for m in unresolved]
+
+    count = 1
+    for _, e in items:
+        count *= e + 1
+    if count > max_divisors:
+        return []
+
+    divisors = [1]
+    for p, e in items:
+        divisors = [d * p**k for d in divisors for k in range(e + 1)]
+
+    lower = 1 << (bit_count - 1)
+    upper = (1 << bit_count) - 1
+
+    pairs = set()
+    for d in divisors:
+        if lower <= d <= upper:
+            q = n // d
+            if lower <= q <= upper and d <= q:
+                pairs.add((d, q))
+
+    return sorted(pairs, key=lambda t: t[1] - t[0])[:max_pairs]
+
+
+# ----------------------------------------------------------------------
 # Numeric helpers
 # ----------------------------------------------------------------------
 
@@ -211,6 +360,7 @@ def build_plot(
     show_diagonal=True,
     show_n_pointer=True,
     known_pair=None,
+    factor_pairs=None,
 ):
     norm = make_normalizer(target_n)
 
@@ -350,6 +500,34 @@ def build_plot(
                 line=dict(color="#14532d", width=2),
             ),
             hovertemplate="Known factor pair<extra></extra>",
+        ))
+
+    # Factorization result --------------------------------------------
+    if factor_pairs:
+        positions = []
+        for fp, fq in factor_pairs:
+            positions.append((fp, fq))
+            if fp != fq:
+                positions.append((fq, fp))
+
+        fig.add_trace(go.Scatter(
+            x=[norm(p) for p, _ in positions],
+            y=[norm(q) for _, q in positions],
+            mode="markers",
+            name="Factorization result",
+            customdata=[[str(p), str(q)] for p, q in positions],
+            marker=dict(
+                symbol="circle",
+                size=17,
+                color="#22c55e",
+                line=dict(color="#14532d", width=3),
+            ),
+            hovertemplate=(
+                "Factorization of N<br>"
+                "p = %{customdata[0]}<br>"
+                "q = %{customdata[1]}"
+                "<extra></extra>"
+            ),
         ))
 
     # Layout ----------------------------------------------------------
@@ -513,6 +691,19 @@ def main():
         show_diagonal = st.checkbox("Show diagonal p = q", value=True)
         show_known_pair = st.checkbox("Show known factor marker", value=True)
 
+        st.divider()
+
+        st.subheader("Factorization")
+
+        run_factorization = st.checkbox(
+            "Factorize N and mark the result (green dot)",
+            value=True,
+        )
+
+        factor_time_limit = st.slider(
+            "Factorization time limit (seconds)", 1, 120, 10, 1
+        )
+
         if bit_count <= SIEVE_MAX_BITS:
             st.caption("All primes in this bit range will be enumerated with a sieve.")
         else:
@@ -533,7 +724,23 @@ def main():
 
         generate = st.button("Generate graph", type="primary", use_container_width=True)
 
-    if "has_generated" not in st.session_state:
+    required_keys = (
+        "last_bit_count",
+        "last_target_text",
+        "last_sample_limit",
+        "last_seed",
+        "last_pair_mode",
+        "last_band",
+        "last_prime_pool_size",
+        "last_factorize",
+        "last_factor_time",
+    )
+
+    # Session state survives code reloads, so a session started with an
+    # older version of the app may be missing keys added later.
+    if "has_generated" not in st.session_state or not all(
+        k in st.session_state for k in required_keys
+    ):
         st.session_state.has_generated = False
 
     if generate:
@@ -544,6 +751,8 @@ def main():
         st.session_state.last_seed = int(seed)
         st.session_state.last_pair_mode = pair_mode
         st.session_state.last_band = band
+        st.session_state.last_factorize = bool(run_factorization)
+        st.session_state.last_factor_time = int(factor_time_limit)
         st.session_state.last_prime_pool_size = (
             int(prime_pool_size) if bit_count > SIEVE_MAX_BITS else None
         )
@@ -655,6 +864,36 @@ def main():
             "It is highlighted with a green star."
         )
 
+    factor_pairs = None
+
+    if st.session_state.last_factorize:
+        with st.spinner("Factorizing N…"):
+            factors, unresolved, elapsed = factorize(
+                str(target_n),
+                float(st.session_state.last_factor_time),
+            )
+
+        expression = format_factorization(factors, unresolved)
+
+        if not unresolved:
+            st.success(f"Factorized in {elapsed:.2f}s: N = {expression}")
+        else:
+            st.warning(
+                f"Time limit reached after {elapsed:.2f}s; "
+                f"partial factorization: N = {expression}"
+            )
+
+        factor_pairs = divisor_pairs_in_square(
+            factors, unresolved, target_n, bit_count
+        )
+
+        if not factor_pairs:
+            st.info(
+                "No factor pair of N has both factors with the selected "
+                "bit count, so there is nothing to mark inside the plotted "
+                "square."
+            )
+
     st.plotly_chart(
         build_plot(
             p_values,
@@ -665,6 +904,7 @@ def main():
             show_diagonal=show_diagonal,
             show_n_pointer=show_n_pointer,
             known_pair=known_pair if show_known_pair else None,
+            factor_pairs=factor_pairs,
         ),
         use_container_width=True,
     )
