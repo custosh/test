@@ -132,382 +132,396 @@ def make_pairs(
     sample_limit: int,
     seed: int
 ):
+    """
+    Generate ordered prime pairs.
+
+    Unlike the previous implementation, this does not
+    enforce p <= q. Both (p,q) and (q,p) are represented.
+    """
 
     m = len(primes)
-    total = m * (m + 1) // 2
+    total = m * m
 
-    exact = total <= EXACT_PAIR_LIMIT
+    rng = random.Random(seed)
+    count = min(total, sample_limit)
 
-    if exact:
-        indices = range(total)
-    else:
-        indices = sampled_indices(
-            total,
-            min(sample_limit, total),
-            seed
-        )
+    # Randomize pair selection rather than using triangular indexing.
+    indices = rng.sample(range(total), count)
 
     p_values = []
     q_values = []
 
     for k in indices:
-        i, j = unrank_pair(k, m)
+        i = k // m
+        j = k % m
 
         p_values.append(primes[i])
         q_values.append(primes[j])
 
+    exact = count == total
+
     return total, exact, p_values, q_values
+
+
+def scaled_integer(value: int, exponent: int) -> float:
+    """
+    Convert a potentially enormous integer into a
+    floating-point value divided by 2**exponent.
+
+    Retains the most significant bits to avoid overflow.
+    """
+
+    if value == 0:
+        return 0.0
+
+    shift = max(0, value.bit_length() - 53)
+    mantissa = float(value >> shift)
+
+    return math.ldexp(mantissa, shift - exponent)
 
 
 def build_plot(
     p_values,
     q_values,
-    lower: int,
-    bit_count: int,
-    target_n: int,
+    lower,
+    bit_count,
+    target_n,
     *,
-    show_hyperbola: bool = True,
-    show_diagonal: bool = True,
-    show_n_pointer: bool = True,
-    known_pair: tuple[int, int] | None = None,
+    show_hyperbola=True,
+    show_diagonal=True,
+    show_n_pointer=True,
+    known_pair=None,
+    jitter=0.004,
+    seed=42,
 ):
 
-    log2_n = math.log2(target_n)
-    log2_lower = bit_count - 1
+    exponent = bit_count - 1
+    axis_max = 2.05
 
-    x_norm = np.asarray(
-        [p / lower for p in p_values],
-        dtype=float
+    # Normalize coordinates to avoid floating-point overflow.
+    x = np.asarray([
+        scaled_integer(p, exponent)
+        for p in p_values
+    ])
+
+    y = np.asarray([
+        scaled_integer(q, exponent)
+        for q in q_values
+    ])
+
+    # Random visual displacement to reduce rigid grid patterns.
+    rng = np.random.default_rng(seed)
+
+    x_display = np.clip(
+        x + rng.uniform(-jitter, jitter, len(x)),
+        0,
+        axis_max
     )
 
-    y_norm = np.asarray(
-        [q / lower for q in q_values],
-        dtype=float
+    y_display = np.clip(
+        y + rng.uniform(-jitter, jitter, len(y)),
+        0,
+        axis_max
     )
 
-    log_ratio = np.empty(len(p_values), dtype=float)
-    product_text = []
+    # Product error, expressed in bits.
+    log_error = np.asarray([
+        math.log2(p) + math.log2(q) - math.log2(target_n)
+        for p, q in zip(p_values, q_values)
+    ])
 
-    for i, (p, q) in enumerate(zip(p_values, q_values)):
-
-        product = p * q
-        product_text.append(str(product))
-
-        if product == target_n:
-            log_ratio[i] = 0.0
-        else:
-            log_ratio[i] = (
-                math.log2(p)
-                + math.log2(q)
-                - log2_n
-            )
-
-    frame = pd.DataFrame({
-        "x": x_norm,
-        "y": y_norm,
-        "log_ratio": log_ratio,
-        "p": [str(v) for v in p_values],
-        "q": [str(v) for v in q_values],
-        "product": product_text,
-    })
+    products = [
+        str(p * q)
+        for p, q in zip(p_values, q_values)
+    ]
 
     fig = go.Figure()
 
-    max_abs = (
-        float(np.max(np.abs(log_ratio)))
-        if len(log_ratio)
-        else 1.0
-    )
+    # --------------------------------------------------
+    # PRIME PAIRS
+    # --------------------------------------------------
 
-    if max_abs == 0:
-        max_abs = 1.0
+    max_error = max(
+        float(np.max(np.abs(log_error))),
+        1e-12
+    ) if len(log_error) else 1.0
 
-    # Candidate prime pairs
     fig.add_trace(go.Scattergl(
-        x=frame["x"],
-        y=frame["y"],
+        x=x_display,
+        y=y_display,
+
         mode="markers",
         name="Prime pairs",
 
-        customdata=frame[
-            ["p", "q", "product", "log_ratio"]
-        ].to_numpy(),
+        customdata=np.column_stack([
+            [str(p) for p in p_values],
+            [str(q) for q in q_values],
+            products,
+            log_error
+        ]),
 
-        marker={
-            "size": (
-                7 if len(frame) < 5_000
-                else 5 if len(frame) < 50_000
-                else 3
-            ),
-            "opacity": 0.78,
-            "color": frame["log_ratio"],
-            "colorscale": "RdBu_r",
-            "cmid": 0,
-            "cmin": -max_abs,
-            "cmax": max_abs,
+        marker=dict(
+            size=5,
+            opacity=0.8,
 
-            "colorbar": {
-                "title": {
-                    "text": "log₂(pq / N)",
-                    "side": "right"
-                },
-                "thickness": 14,
-                "len": 0.82,
-            },
+            color=log_error,
+            colorscale="RdBu_r",
+            cmid=0,
+            cmin=-max_error,
+            cmax=max_error,
 
-            "line": {"width": 0},
-        },
+            colorbar=dict(
+                title="log₂(pq/N)"
+            )
+        ),
 
         hovertemplate=(
             "p = %{customdata[0]}<br>"
             "q = %{customdata[1]}<br>"
-            "p × q = %{customdata[2]}<br>"
-            "log₂(pq / N) = "
-            "%{customdata[3]:+.6g}"
+            "Product = %{customdata[2]}<br>"
+            "Distance = %{customdata[3]:+.6f}"
             "<extra></extra>"
-        ),
+        )
     ))
 
-    # Ideal hyperbola pq = N
-    if show_hyperbola:
+    # --------------------------------------------------
+    # RECTANGULAR HYPERBOLA
+    # --------------------------------------------------
 
-        x_curve = np.linspace(1.0, 2.0, 900)
+    # Normalized equation:
+    #
+    # x * y = N / 2**(2 * exponent)
+    #
+    # Therefore:
+    #
+    # y = C / x
 
-        log2_scaled_n = (
-            log2_n - 2 * log2_lower
+    C = scaled_integer(
+        target_n,
+        2 * exponent
+    )
+
+    if show_hyperbola and 0 < C <= axis_max ** 2:
+
+        # Start where the curve enters the upper boundary.
+        x_start = max(C / axis_max, 1e-10)
+
+        curve_x = np.geomspace(
+            x_start,
+            axis_max,
+            1200
         )
 
-        curve_log_y = (
-            log2_scaled_n - np.log2(x_curve)
-        )
-
-        curve_y = np.full_like(
-            x_curve,
-            np.nan
-        )
+        curve_y = C / curve_x
 
         visible = (
-            (curve_log_y >= 0.0)
-            & (curve_log_y <= 1.0)
-        )
-
-        curve_y[visible] = np.exp2(
-            curve_log_y[visible]
+            (curve_x <= axis_max)
+            & (curve_y <= axis_max)
         )
 
         fig.add_trace(go.Scatter(
-            x=x_curve,
-            y=curve_y,
-            mode="lines",
-            name="Ideal hyperbola: pq = N",
+            x=curve_x[visible],
+            y=curve_y[visible],
 
-            line={
-                "color": "#111827",
-                "width": 3,
-                "dash": "dash"
-            },
+            mode="lines",
+            name="Ideal rectangular hyperbola",
+
+            line=dict(
+                color="#111827",
+                width=3
+            ),
 
             hovertemplate=(
-                "Ideal relation: p × q = N"
+                "Ideal hyperbola<br>"
+                "x × y = C"
                 "<extra></extra>"
-            ),
+            )
         ))
 
-    # Diagonal p = q
+    # --------------------------------------------------
+    # ASYMPTOTES: X AND Y AXES
+    # --------------------------------------------------
+
+    # The rectangular hyperbola has perpendicular
+    # asymptotes at x = 0 and y = 0.
+    #
+    # These are represented by the graph axes.
+
+    # --------------------------------------------------
+    # DIAGONAL
+    # --------------------------------------------------
+
     if show_diagonal:
 
         fig.add_trace(go.Scatter(
-            x=[1.0, 2.0],
-            y=[1.0, 2.0],
+            x=[0, axis_max],
+            y=[0, axis_max],
+
             mode="lines",
             name="p = q",
 
-            line={
-                "color": "#64748b",
-                "width": 1.5,
-                "dash": "dot"
-            },
+            line=dict(
+                color="#64748b",
+                width=1.5,
+                dash="dot"
+            ),
 
-            hoverinfo="skip",
+            hoverinfo="skip"
         ))
 
-    # Balanced reference point sqrt(N)
-    sqrt_n_exponent = (
-        log2_n / 2
-    ) - log2_lower
+    # --------------------------------------------------
+    # BALANCED N POINTER
+    # --------------------------------------------------
 
-    sqrt_n_norm = (
-        math.exp2(sqrt_n_exponent)
-        if 0.0 <= sqrt_n_exponent <= 1.0
-        else None
-    )
+    if show_n_pointer and 0 < C <= axis_max ** 2:
 
-    if (
-        show_n_pointer
-        and sqrt_n_norm is not None
-        and 1.0 <= sqrt_n_norm <= 2.0
-    ):
+        center = math.sqrt(C)
 
         fig.add_trace(go.Scatter(
-            x=[sqrt_n_norm],
-            y=[sqrt_n_norm],
+            x=[center],
+            y=[center],
+
             mode="markers",
+            name="N reference",
 
-            name="N balance point (√N, √N)",
-
-            marker={
-                "symbol": "diamond",
-                "size": 13,
-                "color": "#f59e0b",
-                "line": {
-                    "color": "#7c2d12",
-                    "width": 1.5
-                }
-            },
+            marker=dict(
+                symbol="diamond",
+                size=15,
+                color="#f59e0b",
+                line=dict(
+                    color="#78350f",
+                    width=2
+                )
+            ),
 
             hovertemplate=(
-                "N balance point<br>"
-                "p = q = √N"
+                "Balanced reference<br>"
+                "x = y = √C"
                 "<extra></extra>"
-            ),
+            )
         ))
 
         fig.add_annotation(
-            x=sqrt_n_norm,
-            y=sqrt_n_norm,
+            x=center,
+            y=center,
             text="√N reference",
+
             showarrow=True,
             arrowhead=2,
-            arrowwidth=1.5,
-            arrowcolor="#b45309",
+
             ax=65,
             ay=-45,
-            bgcolor="rgba(255,255,255,0.88)",
+
+            bgcolor="white",
             bordercolor="#f59e0b",
-            borderwidth=1,
-            font={
-                "color": "#78350f",
-                "size": 11
-            },
+            borderwidth=1
         )
 
-    # Known factor pair
+    # --------------------------------------------------
+    # KNOWN FACTORS
+    # --------------------------------------------------
+
     if known_pair is not None:
 
-        known_p, known_q = known_pair
+        kp, kq = known_pair
 
-        known_x = known_p / lower
-        known_y = known_q / lower
+        positions = [(kp, kq)]
+
+        if kp != kq:
+            positions.append((kq, kp))
+
+        known_x = [
+            scaled_integer(p, exponent)
+            for p, q in positions
+        ]
+
+        known_y = [
+            scaled_integer(q, exponent)
+            for p, q in positions
+        ]
 
         fig.add_trace(go.Scatter(
-            x=[known_x],
-            y=[known_y],
+            x=known_x,
+            y=known_y,
+
             mode="markers",
             name="Known factor pair",
 
-            marker={
-                "symbol": "star",
-                "size": 19,
-                "color": "#16a34a",
-                "line": {
-                    "color": "#14532d",
-                    "width": 1.5
-                }
-            },
-
-            customdata=[[
-                str(known_p),
-                str(known_q),
-                str(known_p * known_q)
-            ]],
+            marker=dict(
+                symbol="star",
+                size=19,
+                color="#16a34a",
+                line=dict(
+                    color="#14532d",
+                    width=2
+                )
+            ),
 
             hovertemplate=(
-                "Known factors<br>"
-                "p = %{customdata[0]}<br>"
-                "q = %{customdata[1]}<br>"
-                "pq = %{customdata[2]}"
+                "Known factor pair"
                 "<extra></extra>"
-            ),
+            )
         ))
 
-        fig.add_annotation(
-            x=known_x,
-            y=known_y,
-            text="Known (p, q)",
-            showarrow=True,
-            arrowhead=2,
-            arrowwidth=1.5,
-            arrowcolor="#15803d",
-            ax=-75,
-            ay=55,
-            bgcolor="rgba(255,255,255,0.9)",
-            bordercolor="#16a34a",
-            borderwidth=1,
-            font={
-                "color": "#14532d",
-                "size": 11
-            },
-        )
+    # --------------------------------------------------
+    # GRAPH LAYOUT
+    # --------------------------------------------------
 
-    # Graph formatting
     fig.update_layout(
         template="plotly_white",
-        height=760,
+        height=800,
 
-        title={
-            "text": "Prime-pair products relative to N",
-            "x": 0.02,
-            "xanchor": "left"
-        },
-
-        xaxis_title=(
-            f"p / 2^{bit_count - 1}  (normalized p)"
+        title=dict(
+            text="Prime Products — Rectangular Hyperbola",
+            x=0.02
         ),
 
-        yaxis_title=(
-            f"q / 2^{bit_count - 1}  (normalized q)"
+        xaxis=dict(
+            title=f"p / 2^{exponent}",
+            range=[0, axis_max],
+
+            dtick=0.25,
+            zeroline=True,
+            zerolinewidth=2,
+            zerolinecolor="#111827",
+
+            showgrid=True,
+            gridcolor="#e5e7eb"
         ),
 
-        xaxis={
-            "range": [0.99, 2.01],
-            "constrain": "domain",
-            "zeroline": False,
-            "showline": True,
-            "linecolor": "#94a3b8",
-            "gridcolor": "#e2e8f0",
-            "dtick": 0.1,
-        },
+        yaxis=dict(
+            title=f"q / 2^{exponent}",
+            range=[0, axis_max],
 
-        yaxis={
-            "range": [0.99, 2.01],
-            "scaleanchor": "x",
-            "scaleratio": 1,
-            "zeroline": False,
-            "showline": True,
-            "linecolor": "#94a3b8",
-            "gridcolor": "#e2e8f0",
-            "dtick": 0.1,
-        },
+            dtick=0.25,
+            zeroline=True,
+            zerolinewidth=2,
+            zerolinecolor="#111827",
+
+            showgrid=True,
+            gridcolor="#e5e7eb",
+
+            scaleanchor="x",
+            scaleratio=1
+        ),
+
+        legend=dict(
+            orientation="h",
+            y=1.04,
+            x=0
+        ),
 
         hovermode="closest",
 
-        legend={
-            "orientation": "h",
-            "y": 1.04,
-            "x": 0,
-            "yanchor": "bottom"
-        },
-
-        margin={
-            "l": 85,
-            "r": 55,
-            "t": 115,
-            "b": 85
-        },
+        margin=dict(
+            l=80,
+            r=60,
+            t=110,
+            b=80
+        )
     )
 
     return fig
-
 
 def parse_known_pair(
     p_text: str,
