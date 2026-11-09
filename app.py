@@ -2,30 +2,33 @@ from __future__ import annotations
 
 import math
 import random
+from bisect import bisect_left, bisect_right
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 APP_TITLE = "Prime-pair hyperbola explorer"
-EXACT_PAIR_LIMIT = 200_000
 DEFAULT_SAMPLE_LIMIT = 100_000
 SIEVE_MAX_BITS = 24
 SMALL_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
 
+MODE_NEAR = "Near the hyperbola (pairs with pq ≈ N)"
+MODE_SQUARE = "Whole prime square (all pairs)"
+
+
+# ----------------------------------------------------------------------
+# Primes
+# ----------------------------------------------------------------------
 
 def sieve_primes_in_range(bit_count: int) -> list[int]:
-    """Return every prime with exactly bit_count bits."""
+    """Return every prime with exactly bit_count bits (sorted)."""
     lower = 1 << (bit_count - 1)
     upper = (1 << bit_count) - 1
 
     flags = np.ones(upper - lower + 1, dtype=np.bool_)
 
     for p in range(2, math.isqrt(upper) + 1):
-        if p * p > upper:
-            break
-
         first = max(p * p, ((lower + p - 1) // p) * p)
         flags[first - lower :: p] = False
 
@@ -68,12 +71,7 @@ def is_probable_prime(n: int, rounds: int, rng: random.Random) -> bool:
     return True
 
 
-def generate_probable_primes(
-    bit_count: int,
-    count: int,
-    seed: int
-) -> list[int]:
-
+def generate_probable_primes(bit_count: int, count: int, seed: int) -> list[int]:
     rng = random.Random(seed)
 
     lower = 1 << (bit_count - 1)
@@ -93,84 +91,86 @@ def generate_probable_primes(
     return sorted(found)
 
 
-def row_start(i: int, m: int) -> int:
-    return i * m - (i * (i - 1)) // 2
+# ----------------------------------------------------------------------
+# Pair selection
+# ----------------------------------------------------------------------
 
-
-def unrank_pair(k: int, m: int) -> tuple[int, int]:
-    """Convert an index into an unordered pair index."""
-
-    discriminant = (2 * m + 1) ** 2 - 8 * k
-
-    i = ((2 * m + 1) - math.isqrt(discriminant)) // 2
-
-    while i > 0 and row_start(i, m) > k:
-        i -= 1
-
-    while i + 1 < m and row_start(i + 1, m) <= k:
-        i += 1
-
-    return i, i + (k - row_start(i, m))
-
-
-def sampled_indices(
-    total: int,
-    count: int,
-    seed: int
-) -> list[int]:
-
-    rng = random.Random(seed)
-
-    if count >= total:
-        return list(range(total))
-
-    return rng.sample(range(total), count)
-
-
-def make_pairs(
-    primes: list[int],
-    sample_limit: int,
-    seed: int
-):
-    """
-    Generate ordered prime pairs.
-
-    Unlike the previous implementation, this does not
-    enforce p <= q. Both (p,q) and (q,p) are represented.
-    """
-
+def make_pairs_square(primes: list[int], sample_limit: int, seed: int):
+    """Ordered pairs (p, q) drawn uniformly from the full prime square."""
     m = len(primes)
     total = m * m
 
     rng = random.Random(seed)
     count = min(total, sample_limit)
-
-    # Randomize pair selection rather than using triangular indexing.
     indices = rng.sample(range(total), count)
 
-    p_values = []
-    q_values = []
+    p_values = [primes[k // m] for k in indices]
+    q_values = [primes[k % m] for k in indices]
 
-    for k in indices:
-        i = k // m
-        j = k % m
+    return total, count == total, p_values, q_values
 
-        p_values.append(primes[i])
-        q_values.append(primes[j])
 
-    exact = count == total
+def make_pairs_near_curve(
+    primes: list[int],
+    target_n: int,
+    sample_limit: int,
+    band: int,
+    seed: int,
+):
+    """
+    Ordered pairs (p, q) lying close to the curve pq = N.
+
+    For every prime p, the `band` primes just below and just above N / p
+    are taken as partners q. Because every p is visited, both (p, q) and
+    (q, p) appear, so the cloud is symmetric about p = q and hugs the
+    hyperbola along its whole length.
+    """
+    if not primes:
+        return 0, True, [], []
+
+    # Only p whose ideal partner N/p lies inside the prime range matter.
+    p_min = -(-target_n // primes[-1])  # ceil(N / largest prime)
+    p_max = target_n // primes[0]
+
+    i_lo = bisect_left(primes, p_min)
+    i_hi = bisect_right(primes, p_max)
+
+    eligible = range(i_lo, i_hi)
+    per_p = 2 * band
+    wanted_p = max(1, sample_limit // per_p)
+
+    rng = random.Random(seed)
+
+    if len(eligible) <= wanted_p:
+        chosen = eligible
+        exact = True
+    else:
+        chosen = rng.sample(eligible, wanted_p)
+        exact = False
+
+    m = len(primes)
+    p_values: list[int] = []
+    q_values: list[int] = []
+
+    for i in chosen:
+        p = primes[i]
+        center = bisect_left(primes, target_n // p)
+
+        for j in range(max(0, center - band), min(m, center + band)):
+            p_values.append(p)
+            q_values.append(primes[j])
+
+    total = len(p_values) if exact else len(eligible) * per_p
 
     return total, exact, p_values, q_values
 
 
+# ----------------------------------------------------------------------
+# Numeric helpers
+# ----------------------------------------------------------------------
+
 def scaled_integer(value: int, exponent: int) -> float:
-    """
-    Convert a potentially enormous integer into a
-    floating-point value divided by 2**exponent.
-
-    Retains the most significant bits to avoid overflow.
-    """
-
+    """value / 2**exponent as a float, keeping only the top 53 bits."""
     if value == 0:
         return 0.0
 
@@ -180,10 +180,30 @@ def scaled_integer(value: int, exponent: int) -> float:
     return math.ldexp(mantissa, shift - exponent)
 
 
+def make_normalizer(target_n: int):
+    """
+    Return f(v) = v / sqrt(N), safe for arbitrarily large integers.
+
+    In these coordinates the ideal hyperbola is x * y = 1 and the
+    balanced point (sqrt N, sqrt N) is (1, 1).
+    """
+    root = math.isqrt(target_n)
+    e = max(root.bit_length() - 1, 0)
+    r = scaled_integer(root, e)
+
+    def norm(v: int) -> float:
+        return scaled_integer(v, e) / r
+
+    return norm
+
+
+# ----------------------------------------------------------------------
+# Plot
+# ----------------------------------------------------------------------
+
 def build_plot(
     p_values,
     q_values,
-    lower,
     bit_count,
     target_n,
     *,
@@ -191,345 +211,179 @@ def build_plot(
     show_diagonal=True,
     show_n_pointer=True,
     known_pair=None,
-    jitter=0.004,
-    seed=42,
 ):
+    norm = make_normalizer(target_n)
 
-    exponent = bit_count - 1
-    axis_max = 2.05
+    lower = 1 << (bit_count - 1)
+    upper = (1 << bit_count) - 1
 
-    # Normalize coordinates to avoid floating-point overflow.
-    x = np.asarray([
-        scaled_integer(p, exponent)
-        for p in p_values
-    ])
+    # Square that contains every possible prime pair, in sqrt(N) units.
+    axis_min = norm(lower) * 0.97
+    axis_max = norm(upper) * 1.03
 
-    y = np.asarray([
-        scaled_integer(q, exponent)
-        for q in q_values
-    ])
+    x = np.asarray([norm(p) for p in p_values], dtype=float)
+    y = np.asarray([norm(q) for q in q_values], dtype=float)
 
-    # Random visual displacement to reduce rigid grid patterns.
-    rng = np.random.default_rng(seed)
-
-    x_display = np.clip(
-        x + rng.uniform(-jitter, jitter, len(x)),
-        0,
-        axis_max
-    )
-
-    y_display = np.clip(
-        y + rng.uniform(-jitter, jitter, len(y)),
-        0,
-        axis_max
-    )
-
-    # Product error, expressed in bits.
+    log_target = math.log2(target_n)
     log_error = np.asarray([
-        math.log2(p) + math.log2(q) - math.log2(target_n)
+        math.log2(p) + math.log2(q) - log_target
         for p, q in zip(p_values, q_values)
-    ])
+    ], dtype=float)
 
-    products = [
-        str(p * q)
-        for p, q in zip(p_values, q_values)
-    ]
+    n_pts = len(p_values)
+    customdata = np.empty((n_pts, 4), dtype=object)
+    for k, (p, q) in enumerate(zip(p_values, q_values)):
+        customdata[k, 0] = str(p)
+        customdata[k, 1] = str(q)
+        customdata[k, 2] = str(p * q)
+        customdata[k, 3] = float(log_error[k])
+
+    max_error = max(float(np.max(np.abs(log_error))), 1e-12) if n_pts else 1.0
 
     fig = go.Figure()
 
-    # --------------------------------------------------
-    # PRIME PAIRS
-    # --------------------------------------------------
-
-    max_error = max(
-        float(np.max(np.abs(log_error))),
-        1e-12
-    ) if len(log_error) else 1.0
-
+    # Prime pairs -----------------------------------------------------
     fig.add_trace(go.Scattergl(
-        x=x_display,
-        y=y_display,
-
+        x=x,
+        y=y,
         mode="markers",
         name="Prime pairs",
-
-        customdata=np.column_stack([
-            [str(p) for p in p_values],
-            [str(q) for q in q_values],
-            products,
-            log_error
-        ]),
-
+        customdata=customdata,
         marker=dict(
             size=5,
             opacity=0.8,
-
             color=log_error,
             colorscale="RdBu_r",
             cmid=0,
             cmin=-max_error,
             cmax=max_error,
-
-            colorbar=dict(
-                title="log₂(pq/N)"
-            )
+            colorbar=dict(title="log₂(pq/N)"),
         ),
-
         hovertemplate=(
             "p = %{customdata[0]}<br>"
             "q = %{customdata[1]}<br>"
             "Product = %{customdata[2]}<br>"
             "Distance = %{customdata[3]:+.6f}"
             "<extra></extra>"
-        )
+        ),
     ))
 
-    # --------------------------------------------------
-    # RECTANGULAR HYPERBOLA
-    # --------------------------------------------------
+    # Ideal hyperbola x * y = C (C ≈ 1) -------------------------------
+    C = norm(math.isqrt(target_n)) ** 2  # ≈ 1, robust for huge N
 
-    # Normalized equation:
-    #
-    # x * y = N / 2**(2 * exponent)
-    #
-    # Therefore:
-    #
-    # y = C / x
+    if show_hyperbola and C > 0:
+        x_start = max(axis_min, C / axis_max)
+        x_end = min(axis_max, C / axis_min)
 
-    C = scaled_integer(
-        target_n,
-        2 * exponent
-    )
+        if x_start < x_end:
+            curve_x = np.geomspace(x_start, x_end, 1200)
+            curve_y = C / curve_x
 
-    if show_hyperbola and 0 < C <= axis_max ** 2:
+            fig.add_trace(go.Scatter(
+                x=curve_x,
+                y=curve_y,
+                mode="lines",
+                name="Ideal hyperbola pq = N",
+                line=dict(color="#111827", width=3),
+                hovertemplate="Ideal hyperbola<br>x × y = 1<extra></extra>",
+            ))
 
-        # Start where the curve enters the upper boundary.
-        x_start = max(C / axis_max, 1e-10)
-
-        curve_x = np.geomspace(
-            x_start,
-            axis_max,
-            1200
-        )
-
-        curve_y = C / curve_x
-
-        visible = (
-            (curve_x <= axis_max)
-            & (curve_y <= axis_max)
-        )
-
-        fig.add_trace(go.Scatter(
-            x=curve_x[visible],
-            y=curve_y[visible],
-
-            mode="lines",
-            name="Ideal rectangular hyperbola",
-
-            line=dict(
-                color="#111827",
-                width=3
-            ),
-
-            hovertemplate=(
-                "Ideal hyperbola<br>"
-                "x × y = C"
-                "<extra></extra>"
-            )
-        ))
-
-    # --------------------------------------------------
-    # ASYMPTOTES: X AND Y AXES
-    # --------------------------------------------------
-
-    # The rectangular hyperbola has perpendicular
-    # asymptotes at x = 0 and y = 0.
-    #
-    # These are represented by the graph axes.
-
-    # --------------------------------------------------
-    # DIAGONAL
-    # --------------------------------------------------
-
+    # Diagonal p = q --------------------------------------------------
     if show_diagonal:
-
         fig.add_trace(go.Scatter(
-            x=[0, axis_max],
-            y=[0, axis_max],
-
+            x=[axis_min, axis_max],
+            y=[axis_min, axis_max],
             mode="lines",
             name="p = q",
-
-            line=dict(
-                color="#64748b",
-                width=1.5,
-                dash="dot"
-            ),
-
-            hoverinfo="skip"
+            line=dict(color="#64748b", width=1.5, dash="dot"),
+            hoverinfo="skip",
         ))
 
-    # --------------------------------------------------
-    # BALANCED N POINTER
-    # --------------------------------------------------
+    # Balanced reference (sqrt N, sqrt N) -----------------------------
+    center = math.sqrt(C)
 
-    if show_n_pointer and 0 < C <= axis_max ** 2:
-
-        center = math.sqrt(C)
-
+    if show_n_pointer and axis_min <= center <= axis_max:
         fig.add_trace(go.Scatter(
             x=[center],
             y=[center],
-
             mode="markers",
-            name="N reference",
-
+            name="√N reference",
             marker=dict(
                 symbol="diamond",
                 size=15,
                 color="#f59e0b",
-                line=dict(
-                    color="#78350f",
-                    width=2
-                )
+                line=dict(color="#78350f", width=2),
             ),
-
-            hovertemplate=(
-                "Balanced reference<br>"
-                "x = y = √C"
-                "<extra></extra>"
-            )
+            hovertemplate="Balanced reference<br>p = q = √N<extra></extra>",
         ))
 
         fig.add_annotation(
             x=center,
             y=center,
             text="√N reference",
-
             showarrow=True,
             arrowhead=2,
-
             ax=65,
             ay=-45,
-
             bgcolor="white",
             bordercolor="#f59e0b",
-            borderwidth=1
+            borderwidth=1,
         )
 
-    # --------------------------------------------------
-    # KNOWN FACTORS
-    # --------------------------------------------------
-
+    # Known factors ---------------------------------------------------
     if known_pair is not None:
-
         kp, kq = known_pair
-
         positions = [(kp, kq)]
 
         if kp != kq:
             positions.append((kq, kp))
 
-        known_x = [
-            scaled_integer(p, exponent)
-            for p, q in positions
-        ]
-
-        known_y = [
-            scaled_integer(q, exponent)
-            for p, q in positions
-        ]
-
         fig.add_trace(go.Scatter(
-            x=known_x,
-            y=known_y,
-
+            x=[norm(p) for p, _ in positions],
+            y=[norm(q) for _, q in positions],
             mode="markers",
             name="Known factor pair",
-
             marker=dict(
                 symbol="star",
                 size=19,
                 color="#16a34a",
-                line=dict(
-                    color="#14532d",
-                    width=2
-                )
+                line=dict(color="#14532d", width=2),
             ),
-
-            hovertemplate=(
-                "Known factor pair"
-                "<extra></extra>"
-            )
+            hovertemplate="Known factor pair<extra></extra>",
         ))
 
-    # --------------------------------------------------
-    # GRAPH LAYOUT
-    # --------------------------------------------------
-
+    # Layout ----------------------------------------------------------
     fig.update_layout(
         template="plotly_white",
         height=800,
-
-        title=dict(
-            text="Prime Products — Rectangular Hyperbola",
-            x=0.02
-        ),
-
+        title=dict(text="Prime Products — Rectangular Hyperbola", x=0.02),
         xaxis=dict(
-            title=f"p / 2^{exponent}",
-            range=[0, axis_max],
-
-            dtick=0.25,
-            zeroline=True,
-            zerolinewidth=2,
-            zerolinecolor="#111827",
-
-            showgrid=True,
-            gridcolor="#e5e7eb"
-        ),
-
-        yaxis=dict(
-            title=f"q / 2^{exponent}",
-            range=[0, axis_max],
-
-            dtick=0.25,
-            zeroline=True,
-            zerolinewidth=2,
-            zerolinecolor="#111827",
-
+            title="p / √N",
+            range=[axis_min, axis_max],
             showgrid=True,
             gridcolor="#e5e7eb",
-
+        ),
+        yaxis=dict(
+            title="q / √N",
+            range=[axis_min, axis_max],
+            showgrid=True,
+            gridcolor="#e5e7eb",
             scaleanchor="x",
-            scaleratio=1
+            scaleratio=1,
         ),
-
-        legend=dict(
-            orientation="h",
-            y=1.04,
-            x=0
-        ),
-
+        legend=dict(orientation="h", y=1.04, x=0),
         hovermode="closest",
-
-        margin=dict(
-            l=80,
-            r=60,
-            t=110,
-            b=80
-        )
+        margin=dict(l=80, r=60, t=110, b=80),
     )
 
     return fig
 
-def parse_known_pair(
-    p_text: str,
-    q_text: str,
-    target_n: int,
-    bit_count: int
-):
 
+# ----------------------------------------------------------------------
+# Input parsing
+# ----------------------------------------------------------------------
+
+def parse_known_pair(p_text: str, q_text: str, target_n: int, bit_count: int):
     p_text = p_text.strip().replace("_", "")
     q_text = q_text.strip().replace("_", "")
 
@@ -537,15 +391,10 @@ def parse_known_pair(
         return None, None
 
     if not p_text or not q_text:
-        return None, (
-            "Enter both known factors, or "
-            "leave both fields empty."
-        )
+        return None, "Enter both known factors, or leave both fields empty."
 
     if not p_text.isdecimal() or not q_text.isdecimal():
-        return None, (
-            "Known factors must be positive decimal integers."
-        )
+        return None, "Known factors must be positive decimal integers."
 
     p = int(p_text)
     q = int(q_text)
@@ -556,71 +405,52 @@ def parse_known_pair(
     lower = 1 << (bit_count - 1)
     upper = (1 << bit_count) - 1
 
-    if not (
-        lower <= p <= upper
-        and lower <= q <= upper
-    ):
-        return None, (
-            "Both known factors must have the selected bit count."
-        )
+    if not (lower <= p <= upper and lower <= q <= upper):
+        return None, "Both known factors must have the selected bit count."
 
     if p * q != target_n:
-        return None, (
-            "The known factors must multiply exactly to N."
-        )
+        return None, "The known factors must multiply exactly to N."
 
     check_rng = random.Random(0xC0FFEE)
 
-    if (
-        not is_probable_prime(p, 24, check_rng)
-        or not is_probable_prime(q, 24, check_rng)
-    ):
-        return None, (
-            "Both known factors must pass "
-            "the Miller–Rabin primality check."
-        )
+    if not is_probable_prime(p, 24, check_rng) or not is_probable_prime(q, 24, check_rng):
+        return None, "Both known factors must pass the Miller–Rabin primality check."
 
     return (min(p, q), max(p, q)), None
 
 
+# ----------------------------------------------------------------------
+# App
+# ----------------------------------------------------------------------
+
 def main():
-
-    st.set_page_config(
-        page_title=APP_TITLE,
-        layout="wide"
-    )
-
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
     st.write(
-        "Each dot is a prime pair (p, q). "
-        "Its coordinates are the normalized factor values; "
-        "its colour shows how far pq is above or below N. "
-        "The dashed curve is the exact target relation pq = N."
+        "Each dot is a prime pair (p, q). Coordinates are the factor values "
+        "divided by √N, so the target relation pq = N is the curve xy = 1. "
+        "Colour shows how far pq is above or below N."
     )
 
     with st.sidebar:
-
         st.header("Parameters")
 
-        bit_count = st.number_input(
+        bit_count = int(st.number_input(
             "Bit count per prime",
             min_value=2,
             max_value=4096,
             value=8,
-            step=1
-        )
+            step=1,
+        ))
 
-        bit_count = int(bit_count)
-
-        suggested_n = 1 << (
-            2 * (bit_count - 1)
-        )
+        # Balanced default: the hyperbola crosses the whole prime square
+        # from corner to corner instead of only touching one corner.
+        suggested_n = 1 << (2 * bit_count - 1)
 
         st.caption(
-            f"Prime range: 2^{bit_count - 1} "
-            f"to 2^{bit_count} − 1. "
-            f"Suggested N: 2^{2 * (bit_count - 1)}"
+            f"Prime range: 2^{bit_count - 1} to 2^{bit_count} − 1. "
+            f"Balanced N: 2^{2 * bit_count - 1}"
         )
 
         if "target_n_text" not in st.session_state:
@@ -629,47 +459,27 @@ def main():
         if "previous_suggested_n" not in st.session_state:
             st.session_state.previous_suggested_n = suggested_n
 
-        elif (
-            st.session_state.previous_suggested_n
-            != suggested_n
-        ):
-
-            if (
-                st.session_state.target_n_text
-                == str(st.session_state.previous_suggested_n)
-            ):
+        elif st.session_state.previous_suggested_n != suggested_n:
+            if st.session_state.target_n_text == str(st.session_state.previous_suggested_n):
                 st.session_state.target_n_text = str(suggested_n)
 
             st.session_state.previous_suggested_n = suggested_n
 
-        if st.button(
-            "Reset N to the minimum possible product",
-            use_container_width=True
-        ):
+        if st.button("Reset N to the balanced default", use_container_width=True):
             st.session_state.target_n_text = str(suggested_n)
 
         target_text = st.text_input(
             "Target N (positive decimal integer)",
-            key="target_n_text"
+            key="target_n_text",
         )
 
-        with st.expander(
-            "Known factors (optional)",
-            expanded=False
-        ):
-
+        with st.expander("Known factors (optional)", expanded=False):
             known_p_text = st.text_input(
-                "Known p",
-                key="known_p_text",
-                placeholder="Leave empty"
+                "Known p", key="known_p_text", placeholder="Leave empty"
             )
-
             known_q_text = st.text_input(
-                "Known q",
-                key="known_q_text",
-                placeholder="Leave empty"
+                "Known q", key="known_q_text", placeholder="Leave empty"
             )
-
             st.caption(
                 "When both are entered and p × q = N, "
                 "the pair is highlighted with a green star."
@@ -677,110 +487,80 @@ def main():
 
         st.divider()
 
+        st.subheader("Pair selection")
+
+        pair_mode = st.radio(
+            "Which pairs to plot",
+            [MODE_NEAR, MODE_SQUARE],
+            label_visibility="collapsed",
+        )
+
+        band = 3
+        if pair_mode == MODE_NEAR:
+            band = int(st.slider(
+                "Partners per side of the curve",
+                1, 20, 3, 1,
+                help="For each p, this many primes just below and just "
+                     "above N/p are used as q. Larger = thicker band.",
+            ))
+
+        st.divider()
+
         st.subheader("Graph overlays")
 
-        show_hyperbola = st.checkbox(
-            "Show ideal hyperbola pq = N",
-            value=True
-        )
-
-        show_n_pointer = st.checkbox(
-            "Show N pointer at (√N, √N)",
-            value=True
-        )
-
-        show_diagonal = st.checkbox(
-            "Show diagonal p = q",
-            value=True
-        )
-
-        show_known_pair = st.checkbox(
-            "Show known factor marker",
-            value=True
-        )
+        show_hyperbola = st.checkbox("Show ideal hyperbola pq = N", value=True)
+        show_n_pointer = st.checkbox("Show N pointer at (√N, √N)", value=True)
+        show_diagonal = st.checkbox("Show diagonal p = q", value=True)
+        show_known_pair = st.checkbox("Show known factor marker", value=True)
 
         if bit_count <= SIEVE_MAX_BITS:
-
-            st.caption(
-                "All primes in this bit range "
-                "will be enumerated with a sieve."
-            )
-
+            st.caption("All primes in this bit range will be enumerated with a sieve.")
         else:
-
             prime_pool_size = st.slider(
-                "Number of probable primes to generate",
-                100,
-                5000,
-                500,
-                100
+                "Number of probable primes to generate", 100, 5000, 500, 100
             )
-
             st.caption(
-                "For large bit counts, a reproducible pool "
-                "is generated using Miller–Rabin."
+                "For large bit counts, a reproducible pool is generated "
+                "using Miller–Rabin."
             )
 
         sample_limit = st.slider(
-            "Maximum plotted pairs when sampling",
-            10_000,
-            250_000,
-            DEFAULT_SAMPLE_LIMIT,
-            10_000
+            "Maximum plotted pairs",
+            10_000, 250_000, DEFAULT_SAMPLE_LIMIT, 10_000,
         )
 
-        seed = st.number_input(
-            "Generation seed",
-            min_value=0,
-            value=42,
-            step=1
-        )
+        seed = st.number_input("Generation seed", min_value=0, value=42, step=1)
 
-        generate = st.button(
-            "Generate graph",
-            type="primary",
-            use_container_width=True
-        )
+        generate = st.button("Generate graph", type="primary", use_container_width=True)
 
     if "has_generated" not in st.session_state:
         st.session_state.has_generated = False
 
     if generate:
-
         st.session_state.has_generated = True
-
         st.session_state.last_bit_count = bit_count
         st.session_state.last_target_text = target_text
         st.session_state.last_sample_limit = int(sample_limit)
         st.session_state.last_seed = int(seed)
-
+        st.session_state.last_pair_mode = pair_mode
+        st.session_state.last_band = band
         st.session_state.last_prime_pool_size = (
-            int(prime_pool_size)
-            if bit_count > SIEVE_MAX_BITS
-            else None
+            int(prime_pool_size) if bit_count > SIEVE_MAX_BITS else None
         )
 
     if not st.session_state.has_generated:
-
         st.info(
             "Choose the bit count and N in the sidebar, "
             "then select Generate graph."
         )
-
         return
 
     try:
-
-        n_text = (
-            st.session_state.last_target_text
-            .strip()
-            .replace("_", "")
-        )
+        n_text = st.session_state.last_target_text.strip().replace("_", "")
 
         if not n_text or not n_text.isdecimal():
             raise ValueError(
-                "N must be a positive decimal integer "
-                "(underscores are allowed)."
+                "N must be a positive decimal integer (underscores are allowed)."
             )
 
         target_n = int(n_text)
@@ -789,104 +569,87 @@ def main():
             raise ValueError("N must be greater than zero.")
 
     except ValueError as exc:
-
         st.error(str(exc))
         return
 
     bit_count = st.session_state.last_bit_count
+    last_mode = st.session_state.last_pair_mode
 
     with st.spinner("Generating primes and prime pairs…"):
-
         if bit_count <= SIEVE_MAX_BITS:
-
             primes = sieve_primes_in_range(bit_count)
-
             prime_mode = "Exhaustive prime enumeration"
-
         else:
-
             primes = generate_probable_primes(
                 bit_count,
                 st.session_state.last_prime_pool_size,
-                st.session_state.last_seed
+                st.session_state.last_seed,
             )
+            prime_mode = "Sampled probable-prime pool (Miller–Rabin, 16 rounds)"
 
-            prime_mode = (
-                "Sampled probable-prime pool "
-                "(Miller–Rabin, 16 rounds)"
+        if last_mode == MODE_NEAR:
+            total, exact, p_values, q_values = make_pairs_near_curve(
+                primes,
+                target_n,
+                st.session_state.last_sample_limit,
+                st.session_state.last_band,
+                st.session_state.last_seed,
             )
-
-        total, exact, p_values, q_values = make_pairs(
-            primes,
-            st.session_state.last_sample_limit,
-            st.session_state.last_seed
-        )
+        else:
+            total, exact, p_values, q_values = make_pairs_square(
+                primes,
+                st.session_state.last_sample_limit,
+                st.session_state.last_seed,
+            )
 
     lower = 1 << (bit_count - 1)
-
     shown = len(p_values)
 
     c1, c2, c3, c4 = st.columns(4)
-
     c1.metric("Bit count", f"{bit_count} bits")
     c2.metric("Primes generated", f"{len(primes):,}")
-    c3.metric("Possible prime pairs", f"{total:,}")
+    c3.metric(
+        "Candidate pairs" if last_mode == MODE_NEAR else "Possible ordered pairs",
+        f"{total:,}",
+    )
     c4.metric("Pairs plotted", f"{shown:,}")
 
     st.caption(prime_mode)
 
     if bit_count > SIEVE_MAX_BITS:
-
         st.info(
-            "Large-number mode uses randomly generated "
-            "probable primes, not a proof of primality. "
-            "The Miller–Rabin test uses 16 rounds; "
+            "Large-number mode uses randomly generated probable primes, "
+            "not a proof of primality. The Miller–Rabin test uses 16 rounds; "
             "the pool is reproducible from the seed."
         )
 
-    if exact:
-
-        st.success(
-            f"All {total:,} unordered pairs "
-            "from the generated prime pool are plotted."
-        )
-
-    else:
-
-        st.warning(
-            f"Sampled view: {shown:,} of {total:,} "
-            "possible pairs from the prime pool are plotted."
-        )
-
     possible_min = lower * lower
+    possible_max = ((1 << bit_count) - 1) ** 2
+    n_in_range = possible_min <= target_n <= possible_max
 
-    possible_max = (
-        (1 << bit_count) - 1
-    ) ** 2
-
-    if not (
-        possible_min <= target_n <= possible_max
-    ):
-
+    if not n_in_range:
         st.warning(
-            "N is outside the product range for two "
-            "numbers of this bit length, so the ideal "
-            "hyperbola does not cross the plotted square."
+            "N is outside the product range for two numbers of this bit "
+            "length, so the ideal hyperbola does not cross the prime square."
         )
+
+    if shown == 0:
+        st.warning(
+            "No prime pairs lie near the hyperbola for this N. "
+            "Try a different N or the whole-square mode."
+        )
+    elif exact:
+        st.success(f"All {shown:,} selected pairs are plotted.")
+    else:
+        st.warning(f"Sampled view: {shown:,} of about {total:,} pairs are plotted.")
 
     known_pair, known_error = parse_known_pair(
-        known_p_text,
-        known_q_text,
-        target_n,
-        bit_count
+        known_p_text, known_q_text, target_n, bit_count
     )
 
     if known_error:
-
         st.warning(known_error)
-
     elif known_pair is not None:
-
         st.success(
             "Known factor pair validated: p × q = N. "
             "It is highlighted with a green star."
@@ -896,48 +659,41 @@ def main():
         build_plot(
             p_values,
             q_values,
-            lower,
             bit_count,
             target_n,
             show_hyperbola=show_hyperbola,
             show_diagonal=show_diagonal,
             show_n_pointer=show_n_pointer,
-            known_pair=(
-                known_pair
-                if show_known_pair
-                else None
-            ),
+            known_pair=known_pair if show_known_pair else None,
         ),
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.markdown(
-        "**Reading the graph:** each point stays at its "
-        "actual normalized `(p, q)` coordinates. "
-        "The dashed curve is `pq = N`; points on it have "
-        "an exact product match. Colour shows "
-        "`log₂(pq / N)`: zero is an exact match, "
-        "negative is below N, and positive is above N. "
-        "The orange diamond marks the balanced reference "
-        "`(√N, √N)`; the optional green star marks the "
-        "known factor pair. Hover over a dot to inspect "
-        "its exact p, q and product."
+        "**Reading the graph:** each point sits at its actual `(p, q) / √N` "
+        "position, with no jitter. The black curve is `pq = N` (`xy = 1`). "
+        "Colour shows `log₂(pq / N)`: zero is an exact match, negative is "
+        "below N, positive is above N. The orange diamond marks `(√N, √N)`; "
+        "the optional green star marks the known factor pair. Hover over a "
+        "dot to inspect its exact p, q and product."
     )
 
     with st.expander("How are the prime pairs generated?"):
-
         st.latex(
             r"m = \pi(2^b-1)-\pi(2^{b-1}-1), "
             r"\qquad "
-            r"\#\text{unordered pairs}=\frac{m(m+1)}{2}"
+            r"\#\text{ordered pairs}=m^2"
         )
 
         st.write(
-            "Pairs are unordered because p × q = q × p. "
-            "For bit counts up to 24, the app enumerates "
-            "every prime in the range. Above 24 bits, "
-            "it generates a seeded pool of probable primes "
-            "and plots pairs from that pool."
+            "Pairs are ordered, so both (p, q) and (q, p) appear and the "
+            "plot is symmetric about p = q. In 'Near the hyperbola' mode, "
+            "for every prime p the primes closest to N / p (a few on each "
+            "side) are chosen as q, so the points follow the curve pq = N "
+            "along its whole length. In 'Whole prime square' mode pairs are "
+            "sampled uniformly from all m² combinations, which fills the "
+            "square [2^(b−1), 2^b)². Up to 24 bits every prime in the range "
+            "is enumerated; above that a seeded pool of probable primes is used."
         )
 
 
